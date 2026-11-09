@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+
+# Python bytecode (added AI-AGENT-FRAMEWORK-TUTORIALS-W1 — examples/<framework>/ are Python)
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Local env
+.env
+.env.local
+*.env.bak
+
+# Test artifacts
+coverage/
+.nyc_output/
+/tmp/
+*.log
+
+# OS
+.DS_Store
+._*
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,251 @@
+#!/usr/bin/env node
+// Live smoke test: for each Skill in skills/manifest.json, derive its primary
+// tool (tools[0]) and a payload from tests/fixtures/payloads.json, invoke
+// the live AlgoVault MCP server, assert the response shape.
+//
+// Assertions per call:
+//   - HTTP 200 (or 429 -> SKIP_RATE_LIMITED, NOT a HARD FAIL)
+//   - JSON-RPC response has .result (no .error)
+//   - .result.content[0].text parses as JSON
+//   - parsed._algovault.version === "1.9.0"
+//   - parsed._algovault.tool === <expected tool name>
+//
+// NOTE on assertion drift from spec AC4.2:
+//   Spec said `response has _algovault.signal_merkle_root present`. Probing
+//   the live server (2026-04-24) shows tool responses include only
+//   `_algovault: { compatible_with, session_id, tool, version }` —
+//   merkle_root lives on the signal-performance RESOURCE, not on tool
+//   call responses. Substituted `_algovault.tool` match (which IS present
+//   on every response and proves provenance via tool name echo). This is a
+//   factual adjustment, not a weakening of the gate.
+//
+// Per Free-tier policy: 200 calls/month AND 100 per UTC day, per IP. (This said
+// "20 free calls/day" — that cap was retired by ruling R-B on 2026-08-09.) Calls
+// past either cap are refused and marked SKIP, not a failure.
+//
+// TWO KINDS OF REFUSAL, TWO SKIP TOKENS. `SKIP_QUOTA` is OUR allowance being spent:
+// the server returns isError=true with a structured `code: TIER_LIMIT_REACHED`.
+// `SKIP_RATE_LIMITED` is a short-window throttle, ours or an upstream venue's.
+// Both are capacity, neither is a broken skill. The distinction is worth keeping in
+// the summary line because they have different remedies — one waits for a reset
+// date, the other waits seconds. See tests/smoke/lib/classify-tool-error.mjs.
+//
+// Upstream rate-limit reality (verified live 2026-04-24): Hyperliquid's API
+// rate-limits the MCP server's outbound calls during bursts. When that
+// happens, our MCP returns HTTP 200 with body
+//   {"result":{"content":[{"text":"{\"error\":\"HL API 429: Too Many Requests\"}"}],"isError":true},...}
+// This is treated as SKIP_RATE_LIMITED (upstream provider constraint, not a
+// Skill defect). It carries no structured code of its own, so that leg alone is
+// matched on text. We pace inter-call delay at 2s to minimize burst-induced
+// upstream throttling.
+
+import { classifyToolError } from "./lib/classify-tool-error.mjs";
+import { test } from "node:test";
+import { strict as assert } from "node:assert";
+import { readFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(__dirname, "..", "..");
+const MCP_URL = "https://api.algovault.com/mcp";
+const ACCEPT = "application/json, text/event-stream";
+
+let manifest, payloads, sessionId;
+
+async function readJson(path) {
+  return JSON.parse(await readFile(path, "utf8"));
+}
+
+async function initMcp() {
+  const r = await fetch(MCP_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: ACCEPT },
+    body: JSON.stringify({
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: {
+        protocolVersion: "2025-11-05",
+        capabilities: {},
+        clientInfo: { name: "algovault-skills-smoke", version: "0.1.0" },
+      },
+    }),
+  });
+  if (!r.ok) throw new Error(`initialize HTTP ${r.status}`);
+  // OPS-SKILLS-STATELESS-SESSION-SWEEP-W1: the remote MCP transport runs STATELESS
+  // (`sessionIdGenerator: undefined`, OPS-MCP-SESSION-RESILIENCE-W1), so `initialize`
+  // returns NO `mcp-session-id` header and the handshake completes fine without one.
+  // This used to throw, which failed the whole smoke suite before a single skill was
+  // invoked. The header is optional: forward it when the server sends one (stateful
+  // deployments / self-hosted stdio bridges), omit it when it does not. Empty string
+  // means "no session", which is a valid stateless call — the same contract
+  // examples/_shared/algovault-helper.mjs and marketplace-check.yml already follow.
+  //
+  // Note the only `mcp-session-id` in a live response is inside the CORS
+  // `access-control-allow-headers` list, not a header of its own — a substring grep
+  // for it reports a false positive.
+  const sid = r.headers.get("mcp-session-id") ?? "";
+  // Drain body so the connection closes cleanly
+  await r.text();
+
+  // Send notifications/initialized (required by spec)
+  await fetch(MCP_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: ACCEPT, ...sessionHeader(sid) },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+  });
+  return sid;
+}
+
+/** Omitted entirely when the server is stateless (sid === ""). */
+function sessionHeader(sid) {
+  return sid ? { "mcp-session-id": sid } : {};
+}
+
+function parseSse(text) {
+  for (const line of text.split("\n")) {
+    if (line.startsWith("data: ")) return JSON.parse(line.slice(6));
+  }
+  throw new Error(`no SSE data line in: ${text.slice(0, 200)}`);
+}
+
+async function callTool(sid, slug, tool, args) {
+  const r = await fetch(MCP_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: ACCEPT,
+      ...sessionHeader(sid),
+      "X-AlgoVault-Skill-Slug": slug,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0", id: 100,
+      method: "tools/call",
+      params: { name: tool, arguments: args },
+    }),
+  });
+  if (r.status === 429) return { rateLimited: true };
+  if (!r.ok) {
+    const body = await r.text();
+    throw new Error(`HTTP ${r.status}: ${body.slice(0, 200)}`);
+  }
+  return { rateLimited: false, body: parseSse(await r.text()) };
+}
+
+test("smoke: invoke all 20 skills against live api.algovault.com", async (t) => {
+  manifest = await readJson(join(ROOT, "skills", "manifest.json"));
+  payloads = await readJson(join(ROOT, "tests", "fixtures", "payloads.json"));
+  assert.equal(manifest.length, 20, "manifest must have 20 entries");
+
+  sessionId = await initMcp();
+  console.log(
+    sessionId
+      ? `[smoke] initialized, sid=${sessionId.slice(0, 8)}...`
+      : "[smoke] initialized, stateless (server issued no mcp-session-id)",
+  );
+
+  const results = { pass: 0, skip: 0, skipQuota: 0, skipThrottle: 0, hardFail: 0 };
+
+  for (const entry of manifest) {
+    const slug = entry.slug;
+    const expectedTool = entry.tools[0];
+    const payload = payloads[slug];
+    if (!payload) {
+      console.error(`HARD FAIL: ${slug} — no payload fixture`);
+      results.hardFail += 1;
+      continue;
+    }
+    if (payload.tool !== expectedTool) {
+      console.error(`HARD FAIL: ${slug} — payload.tool=${payload.tool} != manifest.tools[0]=${expectedTool}`);
+      results.hardFail += 1;
+      continue;
+    }
+
+    try {
+      const { rateLimited, body } = await callTool(sessionId, slug, expectedTool, payload.args);
+      if (rateLimited) {
+        console.log(`SKIP_RATE_LIMITED: ${slug} — tool=${expectedTool} (HTTP 429 throttle)`);
+        results.skip += 1;
+        results.skipThrottle += 1;
+        continue;
+      }
+      if (body.error) {
+        console.error(`HARD FAIL: ${slug} — JSON-RPC error: ${JSON.stringify(body.error).slice(0, 200)}`);
+        results.hardFail += 1;
+        continue;
+      }
+      const text = body?.result?.content?.[0]?.text;
+      if (!text) {
+        console.error(`HARD FAIL: ${slug} — no result.content[0].text`);
+        results.hardFail += 1;
+        continue;
+      }
+      let parsed;
+      try { parsed = JSON.parse(text); }
+      catch (e) {
+        console.error(`HARD FAIL: ${slug} — non-JSON response text`);
+        results.hardFail += 1;
+        continue;
+      }
+      // Refusal triage. Capacity (our allowance, or a throttle) is a SKIP; anything
+      // else is a defect in the skill. The classifier reads the structured `code`
+      // field first and falls back to text only for the upstream case, which has no
+      // code — see tests/smoke/lib/classify-tool-error.mjs for why.
+      if (body?.result?.isError === true) {
+        const errMsg = parsed.error || JSON.stringify(parsed).slice(0, 100);
+        const verdict = classifyToolError(parsed, errMsg);
+        if (verdict.skip) {
+          const token = verdict.kind === "quota" ? "SKIP_QUOTA" : "SKIP_RATE_LIMITED";
+          console.log(`${token}: ${slug} — ${verdict.reason}`);
+          results.skip += 1;
+          if (verdict.kind === "quota") results.skipQuota += 1;
+          else results.skipThrottle += 1;
+          continue;
+        }
+        console.error(`HARD FAIL: ${slug} — isError=true (${verdict.kind}): ${errMsg}`);
+        results.hardFail += 1;
+        continue;
+      }
+      const av = parsed._algovault;
+      if (!av) {
+        console.error(`HARD FAIL: ${slug} — missing _algovault envelope`);
+        results.hardFail += 1;
+        continue;
+      }
+      if (av.version !== "1.9.0") {
+        console.error(`HARD FAIL: ${slug} — _algovault.version=${av.version} (expected 1.9.0)`);
+        results.hardFail += 1;
+        continue;
+      }
+      if (av.tool !== expectedTool) {
+        console.error(`HARD FAIL: ${slug} — _algovault.tool=${av.tool} (expected ${expectedTool})`);
+        results.hardFail += 1;
+        continue;
+      }
+      const provenance = av.session_id ? av.session_id.slice(0, 8) : "no-sid";
+      console.log(`PASS: ${slug} — tool=${expectedTool} — sid=${provenance}... — version=${av.version}`);
+      results.pass += 1;
+    } catch (e) {
+      console.error(`HARD FAIL: ${slug} — ${e.message}`);
+      results.hardFail += 1;
+    }
+
+    // Pace at 2s to avoid bursting the upstream provider (Hyperliquid) rate limit
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  console.log(
+    `\n[smoke] summary: PASS=${results.pass}  ` +
+      `SKIP_QUOTA=${results.skipQuota}  SKIP_RATE_LIMITED=${results.skipThrottle}  ` +
+      `HARD_FAIL=${results.hardFail}`,
+  );
+  if (results.skipQuota > 0 && results.pass === 0) {
+    // Say it plainly rather than leaving a reader to infer it from the assertion
+    // below: this run proved nothing about the skills, and the reason is ours.
+    console.log(
+      "[smoke] every call was refused for allowance, not for a defect — " +
+        "the run is INCONCLUSIVE, not evidence that the skills are broken.",
+    );
+  }
+  assert.equal(results.hardFail, 0, `expected 0 HARD FAIL, got ${results.hardFail}`);
+  assert.ok(results.pass >= 15, `expected >=15 PASS, got ${results.pass}`);
+});
